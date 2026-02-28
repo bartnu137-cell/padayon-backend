@@ -1,0 +1,21 @@
+{
+  "version": 2,
+  "updatedAt": null,
+  "folders": [
+    { "path": "GLOBAL", "createdAt": "2026-02-17T00:00:00.000Z" },
+    { "path": "T-AY-PI/OTHER", "createdAt": "2026-02-17T00:00:00.000Z" },
+    { "path": "EXHALE FILE", "createdAt": "2026-02-17T00:00:00.000Z" },
+    { "path": "EXHALE FILE/NOTES", "createdAt": "2026-02-17T00:00:00.000Z" },
+    { "path": "EXHALE FILE/PRACTICE QUIZ", "createdAt": "2026-02-17T00:00:00.000Z" },
+    { "path": "EXHALE FILE/EXAM", "createdAt": "2026-02-17T00:00:00.000Z" },
+    { "path": "PAWER-LAYN FILE/NOTES", "createdAt": "2026-02-17T00:00:00.000Z" },
+    { "path": "PAWER-LAYN FILE/PRACTICE QUIZ", "createdAt": "2026-02-17T00:00:00.000Z" },
+    { "path": "PAWER-LAYN FILE/EXAM", "createdAt": "2026-02-17T00:00:00.000Z" },
+    { "path": "UNDERGROUNDS/FORMULAS", "createdAt": "2026-02-17T00:00:00.000Z" },
+    { "path": "UNDERGROUNDS/CALCULATOR TECHNIQUES", "createdAt": "2026-02-17T00:00:00.000Z" },
+    { "path": "UNDERGROUNDS/PROBLEM EXERCISES", "createdAt": "2026-02-17T00:00:00.000Z" },
+    { "path": "UNDERGROUNDS/TERMS & OBJECTIVES", "createdAt": "2026-02-17T00:00:00.000Z" }
+  ],
+  "quizSets": [],
+  "pdfs": []
+}
