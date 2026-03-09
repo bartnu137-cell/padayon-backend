@@ -148,6 +148,47 @@ function toSafeAccount(acc) {
   };
 }
 
+function ensureAccountCollections(acc) {
+  if (!acc || typeof acc !== 'object') return acc;
+  if (!Array.isArray(acc.scoreHistory)) acc.scoreHistory = [];
+  return acc;
+}
+
+function clampInt(value, min, max, fallback = 0) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(n)));
+}
+
+function makeId(prefix) {
+  return String(prefix || 'id') + '_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+}
+
+function getAccountScoreHistory(acc) {
+  ensureAccountCollections(acc);
+  return acc.scoreHistory;
+}
+
+function sanitizeScoreEntry(input) {
+  const score = clampInt(input?.score, 0, 100000, 0);
+  const total = clampInt(input?.total, 0, 100000, 0);
+  const percent = total > 0 ? Math.round((score / total) * 1000) / 10 : 0;
+
+  return {
+    id: makeId('score'),
+    ts: Date.now(),
+    recordedAt: nowISO(),
+    setId: String(input?.setId || '').slice(0, 120) || null,
+    setTitle: String(input?.setTitle || 'Untitled Quiz').slice(0, 200),
+    folder: String(input?.folder || '').slice(0, 240) || null,
+    source: String(input?.source || 'custom').slice(0, 40) || 'custom',
+    mode: String(input?.mode || 'exam').slice(0, 40) || 'exam',
+    score,
+    total,
+    percent,
+  };
+}
+
 function sanitizeLibrary(input) {
   if (!input || typeof input !== 'object') return emptyLibrary();
 
@@ -162,7 +203,12 @@ function sanitizeLibrary(input) {
   out.updatedAt = String(input.updatedAt || '') || null;
   out.folders = Array.isArray(input.folders) ? input.folders : [];
   out.quizSets = Array.isArray(input.quizSets) ? input.quizSets : [];
-  out.pdfs = Array.isArray(input.pdfs) ? input.pdfs : [];
+
+  const pdfs = Array.isArray(input.pdfs) ? input.pdfs : [];
+  if (pdfs.some(p => String(p?.src || '').startsWith('data:'))) {
+    throw new Error('Embedded PDF data URLs are no longer allowed. Store only PDF URLs/paths in library.');
+  }
+  out.pdfs = pdfs;
 
   return out;
 }
@@ -220,6 +266,14 @@ function initDbOnDisk() {
     changed = true;
   }
 
+  db.accounts.forEach(acc => {
+    if (!acc || typeof acc !== 'object') return;
+    if (!Array.isArray(acc.scoreHistory)) {
+      acc.scoreHistory = [];
+      changed = true;
+    }
+  });
+
   if (changed || !fs.existsSync(DB_FILE)) {
     writeJsonAtomic(DB_FILE, db);
   }
@@ -250,7 +304,7 @@ function isOriginAllowed(origin) {
 }
 
 const app = express();
-app.use(express.json({ limit: '200mb' }));
+app.use(express.json({ limit: '25mb' }));
 app.use(cors({
   origin: (origin, cb) => {
     if (isOriginAllowed(origin)) return cb(null, true);
@@ -378,6 +432,7 @@ app.post('/api/accounts', requireAuth, requireAdmin, (req, res) => {
     passwordHash: bcrypt.hashSync(password, 10),
     role,
     createdAt: nowISO(),
+    scoreHistory: [],
   };
 
   db.accounts.push(acc);
@@ -386,6 +441,33 @@ app.post('/api/accounts', requireAuth, requireAdmin, (req, res) => {
   addLog(req.user.username, `Created account: ${username} (${role})`);
 
   res.json({ ok: true, account: toSafeAccount(acc) });
+});
+
+app.get('/api/scores', requireAuth, (req, res) => {
+  const targetUsername = (req.user.role === 'admin' && req.query?.username)
+    ? normalizeUsername(req.query.username)
+    : req.user.username;
+
+  const acc = findAccount(db, targetUsername);
+  if (!acc) return res.status(404).json({ error: 'Account not found.' });
+
+  const items = getAccountScoreHistory(acc).slice(-200).reverse();
+  res.json({ username: acc.username, items });
+});
+
+app.post('/api/scores', requireAuth, (req, res) => {
+  const acc = findAccount(db, req.user.username);
+  if (!acc) return res.status(404).json({ error: 'Account not found.' });
+
+  const item = sanitizeScoreEntry(req.body || {});
+  const history = getAccountScoreHistory(acc);
+  history.push(item);
+  if (history.length > 500) acc.scoreHistory = history.slice(-500);
+
+  saveDb();
+  addLog(req.user.username, `Saved score: ${item.setTitle} (${item.score}/${item.total})`);
+
+  res.json({ ok: true, item });
 });
 
 // --- WebSockets ---
