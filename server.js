@@ -16,6 +16,7 @@ const fs = require('fs');
 const { WebSocketServer } = require('ws');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const multer = require('multer');
 
 const PORT = Number(process.env.PORT || 3000);
 const JWT_SECRET = String(process.env.JWT_SECRET || 'CHANGE_ME_IN_RENDER_ENV');
@@ -29,6 +30,9 @@ const DB_FILE = path.join(DATA_DIR, 'db.json');
 
 // Used only when db.json doesn't exist yet
 const INITIAL_LIBRARY_FILE = String(process.env.INITIAL_LIBRARY_FILE || path.join(__dirname, 'initial_library.json'));
+const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
+const PDF_UPLOADS_DIR = path.join(UPLOADS_DIR, 'pdfs');
+const MAX_PDF_UPLOAD_MB = Number(process.env.MAX_PDF_UPLOAD_MB || 100);
 
 function nowISO() {
   return new Date().toISOString();
@@ -98,6 +102,50 @@ function safeJsonParse(text, fallback = null) {
 
 function ensureDir(dir) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
+function safeFileStem(name) {
+  return String(name || 'file')
+    .replace(/\.[^.]+$/, '')
+    .replace(/[^a-z0-9_-]+/gi, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 80) || 'file';
+}
+
+function makeStoredPdfFilename(originalName) {
+  const stem = safeFileStem(originalName);
+  return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}_${stem}.pdf`;
+}
+
+function getPublicBaseUrl(req) {
+  const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'http').split(',')[0].trim();
+  const host = String(req.get('host') || '').trim();
+  return host ? `${proto}://${host}` : '';
+}
+
+function buildPdfUploadResponse(req, filename) {
+  const relativePath = `/uploads/pdfs/${filename}`;
+  const base = getPublicBaseUrl(req);
+  return {
+    filename,
+    path: relativePath,
+    url: base ? `${base}${relativePath}` : relativePath,
+  };
+}
+
+function resolveManagedPdfPath(relativePath) {
+  const clean = String(relativePath || '').trim();
+  if (!clean.startsWith('/uploads/pdfs/')) return null;
+
+  const filename = path.basename(clean);
+  if (!filename || filename === '.' || filename === '..') return null;
+
+  const abs = path.join(PDF_UPLOADS_DIR, filename);
+  const normalizedRoot = path.resolve(PDF_UPLOADS_DIR) + path.sep;
+  const normalizedAbs = path.resolve(abs);
+  if (!normalizedAbs.startsWith(normalizedRoot) && normalizedAbs !== path.resolve(PDF_UPLOADS_DIR)) return null;
+
+  return { filename, abs: normalizedAbs, path: `/uploads/pdfs/${filename}` };
 }
 
 function emptyLibrary() {
@@ -215,6 +263,8 @@ function sanitizeLibrary(input) {
 
 function initDbOnDisk() {
   ensureDir(DATA_DIR);
+  ensureDir(UPLOADS_DIR);
+  ensureDir(PDF_UPLOADS_DIR);
 
   let db = readJsonFileIfExists(DB_FILE);
   if (!db || typeof db !== 'object') db = defaultDb();
@@ -310,9 +360,34 @@ app.use(cors({
     if (isOriginAllowed(origin)) return cb(null, true);
     return cb(new Error('CORS blocked for origin: ' + origin));
   },
-  methods: ['GET', 'POST', 'PUT', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
+app.use('/uploads', express.static(UPLOADS_DIR, {
+  maxAge: '7d',
+  index: false,
+}));
+
+const pdfUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => {
+      ensureDir(PDF_UPLOADS_DIR);
+      cb(null, PDF_UPLOADS_DIR);
+    },
+    filename: (_req, file, cb) => {
+      cb(null, makeStoredPdfFilename(file.originalname || 'file.pdf'));
+    },
+  }),
+  limits: {
+    fileSize: MAX_PDF_UPLOAD_MB * 1024 * 1024,
+  },
+  fileFilter: (_req, file, cb) => {
+    const mime = String(file.mimetype || '').toLowerCase();
+    const ext = path.extname(String(file.originalname || '')).toLowerCase();
+    if (mime === 'application/pdf' || ext === '.pdf') return cb(null, true);
+    return cb(new Error('Only PDF files are allowed.'));
+  },
+});
 
 // --- Auth middleware ---
 function requireAuth(req, res, next) {
@@ -386,6 +461,45 @@ app.post('/api/auth/login', async (req, res) => {
     token,
     user: { username: acc.username, role: acc.role },
   });
+});
+
+app.post('/api/uploads/pdf', requireAuth, requireAdmin, (req, res) => {
+  pdfUpload.single('file')(req, res, (err) => {
+    if (err) {
+      const message = err instanceof multer.MulterError
+        ? (err.code === 'LIMIT_FILE_SIZE'
+          ? `PDF is too large. Max size is ${MAX_PDF_UPLOAD_MB} MB.`
+          : err.message)
+        : (err?.message || 'Upload failed.');
+      return res.status(400).json({ error: message });
+    }
+
+    if (!req.file) return res.status(400).json({ error: 'PDF file is required.' });
+
+    const fileInfo = buildPdfUploadResponse(req, req.file.filename);
+    addLog(req.user.username, `Uploaded PDF: ${req.file.originalname || req.file.filename}`);
+    return res.json({ ok: true, ...fileInfo });
+  });
+});
+
+app.delete('/api/uploads/pdf', requireAuth, requireAdmin, (req, res) => {
+  const requestedPath = String(req.query?.path || req.body?.path || '').trim();
+  if (!requestedPath) return res.status(400).json({ error: 'path is required.' });
+
+  const resolved = resolveManagedPdfPath(requestedPath);
+  if (!resolved) return res.status(400).json({ error: 'Only managed /uploads/pdfs files can be deleted.' });
+
+  const existed = fs.existsSync(resolved.abs);
+  if (existed) {
+    try {
+      fs.unlinkSync(resolved.abs);
+    } catch {
+      return res.status(500).json({ error: 'Failed to delete file.' });
+    }
+  }
+
+  addLog(req.user.username, `Deleted PDF file: ${resolved.filename}`);
+  return res.json({ ok: true, deleted: existed, path: resolved.path });
 });
 
 app.get('/api/library', (req, res) => {
