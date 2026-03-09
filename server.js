@@ -10,6 +10,7 @@
 const express = require('express');
 const cors = require('cors');
 const http = require('http');
+const https = require('https');
 const path = require('path');
 const fs = require('fs');
 const { WebSocketServer } = require('ws');
@@ -18,7 +19,9 @@ const jwt = require('jsonwebtoken');
 
 const PORT = Number(process.env.PORT || 3000);
 const JWT_SECRET = String(process.env.JWT_SECRET || 'CHANGE_ME_IN_RENDER_ENV');
+const RECAPTCHA_SECRET_KEY = String(process.env.RECAPTCHA_SECRET_KEY || '');
 const CORS_ORIGIN_RAW = String(process.env.CORS_ORIGIN || '*');
+
 
 // If you attach a Render Disk, set DATA_DIR=/var/data (or whatever mount path you pick)
 const DATA_DIR = String(process.env.DATA_DIR || path.join(__dirname, 'data'));
@@ -29,6 +32,60 @@ const INITIAL_LIBRARY_FILE = String(process.env.INITIAL_LIBRARY_FILE || path.joi
 
 function nowISO() {
   return new Date().toISOString();
+}
+
+function verifyRecaptchaToken(token, remoteIp) {
+  return new Promise((resolve) => {
+    if (!RECAPTCHA_SECRET_KEY) {
+      console.error('Missing RECAPTCHA_SECRET_KEY in environment.');
+      return resolve(false);
+    }
+
+    const postData = new URLSearchParams({
+      secret: RECAPTCHA_SECRET_KEY,
+      response: String(token || ''),
+    });
+
+    if (remoteIp) {
+      postData.append('remoteip', String(remoteIp));
+    }
+
+    const req = https.request(
+      'https://www.google.com/recaptcha/api/siteverify',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Content-Length': Buffer.byteLength(postData.toString()),
+        },
+      },
+      (res) => {
+        let body = '';
+
+        res.on('data', (chunk) => {
+          body += chunk;
+        });
+
+        res.on('end', () => {
+          try {
+            const json = JSON.parse(body);
+            resolve(!!json.success);
+          } catch (err) {
+            console.error('reCAPTCHA parse error:', err);
+            resolve(false);
+          }
+        });
+      }
+    );
+
+    req.on('error', (err) => {
+      console.error('reCAPTCHA request error:', err);
+      resolve(false);
+    });
+
+    req.write(postData.toString());
+    req.end();
+  });
 }
 
 function safeJsonParse(text, fallback = null) {
@@ -134,9 +191,17 @@ function initDbOnDisk() {
   // These match your existing frontend defaults.
   let changed = false;
   const wantSeed = [
-    { username: 'admin', password: 'admin', role: 'admin' },
-    { username: 'EE', password: 'C-1', role: 'user' },
-  ];
+  { username: 'admin', password: 'admin', role: 'admin' },
+  { username: 'saligao', password: 'carl', role: 'user' },
+  { username: 'ramos', password: 'carl', role: 'user' },
+  { username: 'fernandez', password: 'cristopher', role: 'user' },
+  { username: 'cortez', password: 'cyron', role: 'user' },
+  { username: 'castillo', password: 'gian', role: 'user' },
+  { username: 'maceda', password: 'mj', role: 'user' },
+  { username: 'quillopo', password: 'pj', role: 'user' },
+  { username: 'arcenas', password: 'rheygie', role: 'user' },
+  { username: 'felizarta', password: 'treb', role: 'user' },
+];
 
   wantSeed.forEach(seed => {
     if (!findAccount(db, seed.username)) {
@@ -185,7 +250,7 @@ function isOriginAllowed(origin) {
 }
 
 const app = express();
-app.use(express.json({ limit: '25mb' }));
+app.use(express.json({ limit: '200mb' }));
 app.use(cors({
   origin: (origin, cb) => {
     if (isOriginAllowed(origin)) return cb(null, true);
@@ -201,16 +266,11 @@ function requireAuth(req, res, next) {
   const token = hdr.startsWith('Bearer ') ? hdr.slice('Bearer '.length) : '';
   if (!token) return res.status(401).json({ error: 'Missing Bearer token.' });
 
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = {
-      username: decoded.username,
-      role: decoded.role,
-    };
-    return next();
-  } catch {
-    return res.status(401).json({ error: 'Invalid token.' });
-  }
+  const user = getUserFromActiveToken(token);
+  if (!user) return res.status(401).json({ error: 'Invalid or expired session.' });
+
+  req.user = user;
+  return next();
 }
 
 function requireAdmin(req, res, next) {
@@ -228,11 +288,23 @@ app.get('/api/health', (req, res) => {
   res.json({ ok: true, time: nowISO() });
 });
 
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   const username = normalizeUsername(req.body?.username);
   const password = String(req.body?.password || '');
+  const captchaToken = String(req.body?.captchaToken || '');
 
-  if (!username || !password) return res.status(400).json({ error: 'username and password required.' });
+  if (!username || !password) {
+    return res.status(400).json({ error: 'username and password required.' });
+  }
+
+  if (!captchaToken) {
+    return res.status(400).json({ error: 'Please complete the captcha.' });
+  }
+
+  const captchaOk = await verifyRecaptchaToken(captchaToken, req.ip);
+  if (!captchaOk) {
+    return res.status(400).json({ error: 'Captcha verification failed.' });
+  }
 
   const acc = findAccount(db, username);
   if (!acc) return res.status(401).json({ error: 'Invalid credentials.' });
@@ -240,13 +312,23 @@ app.post('/api/auth/login', (req, res) => {
   const ok = bcrypt.compareSync(password, acc.passwordHash || '');
   if (!ok) return res.status(401).json({ error: 'Invalid credentials.' });
 
+  acc.sessionId = makeSessionId();
+  acc.lastLoginAt = nowISO();
+  saveDb();
+
+  forceLogoutUserSockets(acc.username);
+
   const token = jwt.sign(
-    { username: acc.username, role: acc.role },
+    {
+      username: acc.username,
+      role: acc.role,
+      sessionId: acc.sessionId,
+    },
     JWT_SECRET,
     { expiresIn: '30d' }
   );
 
-  res.json({
+  return res.json({
     token,
     user: { username: acc.username, role: acc.role },
   });
@@ -255,6 +337,7 @@ app.post('/api/auth/login', (req, res) => {
 app.get('/api/library', (req, res) => {
   res.json(db.library || emptyLibrary());
 });
+
 
 app.put('/api/library', requireAuth, requireAdmin, (req, res) => {
   try {
@@ -306,8 +389,28 @@ app.post('/api/accounts', requireAuth, requireAdmin, (req, res) => {
 });
 
 // --- WebSockets ---
+let forceLogoutUserSockets = () => {};
+
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
+
+forceLogoutUserSockets = function (username) {
+  const target = String(username || '').toLowerCase();
+
+  wss.clients.forEach(ws => {
+    const st = clients.get(ws);
+    if (!st || !st.username) return;
+
+    if (String(st.username).toLowerCase() === target) {
+      wsSend(ws, {
+        type: 'force_logout',
+        reason: 'This account was logged in on another device.',
+      });
+
+      try { ws.close(); } catch {}
+    }
+  });
+};
 
 // ws -> state
 const clients = new Map();
@@ -383,29 +486,17 @@ function schedulePresenceBroadcast() {
 }
 
 function userFromToken(token) {
-  try {
-    const decoded = jwt.verify(String(token || ''), JWT_SECRET);
-    return {
-      username: decoded.username,
-      role: decoded.role,
-    };
-  } catch {
-    return null;
-  }
+  return getUserFromActiveToken(token);
 }
 
 function safeHelloUser(msg) {
-  // Prefer token-based identity
   const tok = msg?.token;
-  if (tok) {
-    const u = userFromToken(tok);
-    if (u) return u;
-  }
+  if (!tok) return null;
 
-  // Fallback: allow presence without token (role forced to user)
-  const username = normalizeUsername(msg?.username);
-  if (!username) return null;
-  return { username, role: 'user' };
+  const u = userFromToken(tok);
+  if (!u) return null;
+
+  return u;
 }
 
 function summarizeActivity(msg) {
@@ -472,7 +563,7 @@ wss.on('connection', (ws, req) => {
     if (type === 'hello') {
       const u = safeHelloUser(msg);
       if (!u) {
-        wsSend(ws, { type: 'error', error: 'hello requires token or username' });
+        wsSend(ws, { type: 'error', error: 'hello requires a valid token' });
         try { ws.close(); } catch {}
         return;
       }
@@ -572,3 +663,26 @@ server.listen(PORT, () => {
   console.log(`CORS origin: ${CORS_ORIGIN_RAW}`);
   console.log(`DB file: ${DB_FILE}`);
 });
+
+function makeSessionId() {
+  return 'sess_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
+}
+
+function getUserFromActiveToken(token) {
+  try {
+    const decoded = jwt.verify(String(token || ''), JWT_SECRET);
+    const acc = findAccount(db, decoded.username);
+    if (!acc) return null;
+
+    if (!decoded.sessionId) return null;
+    if (acc.sessionId !== decoded.sessionId) return null;
+
+    return {
+      username: acc.username,
+      role: acc.role,
+      sessionId: acc.sessionId,
+    };
+  } catch {
+    return null;
+  }
+}
