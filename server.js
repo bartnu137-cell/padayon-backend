@@ -33,6 +33,12 @@ const PDF_UPLOADS_DIR = path.join(UPLOADS_DIR, 'pdfs');
 const MAX_PDF_UPLOAD_MB = Number(process.env.MAX_PDF_UPLOAD_MB || 100);
 const MAX_LIBRARY_VERSIONS = Number(process.env.MAX_LIBRARY_VERSIONS || 20);
 const MAX_SCORE_HISTORY = Number(process.env.MAX_SCORE_HISTORY || 80);
+const MAX_NOTIFICATIONS = Number(process.env.MAX_NOTIFICATIONS || 120);
+const MAX_AUDIT_LOG = Number(process.env.MAX_AUDIT_LOG || 500);
+const MAX_FAILED_LOGINS = Number(process.env.MAX_FAILED_LOGINS || 5);
+const ACCOUNT_LOCK_MINUTES = Number(process.env.ACCOUNT_LOCK_MINUTES || 15);
+const SESSION_EXPIRES_IN = String(process.env.SESSION_EXPIRES_IN || '14d');
+const PASSWORD_MIN_LENGTH = Number(process.env.PASSWORD_MIN_LENGTH || 8);
 
 function nowISO() {
   return new Date().toISOString();
@@ -65,6 +71,8 @@ function defaultDb() {
     accounts: [],
     library: emptyLibrary(),
     libraryVersions: [],
+    notifications: [],
+    auditLog: [],
   };
 }
 
@@ -104,6 +112,9 @@ function ensureAccountCollections(acc) {
   if (!acc || typeof acc !== 'object') return acc;
   if (!Array.isArray(acc.scoreHistory)) acc.scoreHistory = [];
   if (!acc.progressBySet || typeof acc.progressBySet !== 'object' || Array.isArray(acc.progressBySet)) acc.progressBySet = {};
+  if (!Array.isArray(acc.notificationsRead)) acc.notificationsRead = [];
+  if (!Number.isFinite(Number(acc.failedLoginCount))) acc.failedLoginCount = 0;
+  if (!acc.lockUntil) acc.lockUntil = null;
   return acc;
 }
 
@@ -314,6 +325,69 @@ function createLibraryVersion(user, previousLibrary) {
   };
 }
 
+function isStrongPassword(password) {
+  const value = String(password || '');
+  return value.length >= PASSWORD_MIN_LENGTH && /[A-Za-z]/.test(value) && /\d/.test(value);
+}
+
+function addAudit(actor, action, details = '', meta = {}) {
+  if (!Array.isArray(db.auditLog)) db.auditLog = [];
+  const item = {
+    id: makeId('audit'),
+    ts: Date.now(),
+    actor: String(actor || 'system'),
+    action: String(action || 'event'),
+    details: String(details || ''),
+    meta: meta && typeof meta === 'object' ? meta : {},
+  };
+  db.auditLog.unshift(item);
+  db.auditLog = db.auditLog.slice(0, MAX_AUDIT_LOG);
+  return item;
+}
+
+function pushNotification(type, title, body, opts = {}) {
+  if (!Array.isArray(db.notifications)) db.notifications = [];
+  const item = {
+    id: makeId('note'),
+    ts: Date.now(),
+    type: String(type || 'notice'),
+    title: String(title || 'Notification').slice(0, 160),
+    body: String(body || '').slice(0, 400),
+    audience: opts.audience === 'user' ? 'user' : 'all',
+    username: opts.username ? String(opts.username).toLowerCase() : null,
+    createdBy: String(opts.createdBy || 'system'),
+  };
+  db.notifications.unshift(item);
+  db.notifications = db.notifications.slice(0, MAX_NOTIFICATIONS);
+  return item;
+}
+
+function getNotificationsForUser(user) {
+  const username = String(user?.username || '').toLowerCase();
+  const role = String(user?.role || 'user');
+  return (db.notifications || []).filter(item => {
+    if (item.audience === 'all') return true;
+    if (item.audience === 'user' && item.username === username) return true;
+    if (role === 'admin' && item.createdBy === 'system') return true;
+    return false;
+  });
+}
+
+function registerFailedLogin(acc) {
+  ensureAccountCollections(acc);
+  acc.failedLoginCount = Number(acc.failedLoginCount || 0) + 1;
+  if (acc.failedLoginCount >= MAX_FAILED_LOGINS) {
+    acc.lockUntil = new Date(Date.now() + ACCOUNT_LOCK_MINUTES * 60000).toISOString();
+    acc.failedLoginCount = 0;
+  }
+}
+
+function clearFailedLoginState(acc) {
+  ensureAccountCollections(acc);
+  acc.failedLoginCount = 0;
+  acc.lockUntil = null;
+}
+
 function verifyRecaptchaToken(token, remoteIp) {
   return new Promise((resolve) => {
     if (!RECAPTCHA_SECRET_KEY) {
@@ -385,6 +459,8 @@ function initDbOnDisk() {
 
   if (!Array.isArray(db.accounts)) db.accounts = [];
   if (!Array.isArray(db.libraryVersions)) db.libraryVersions = [];
+  if (!Array.isArray(db.notifications)) db.notifications = [];
+  if (!Array.isArray(db.auditLog)) db.auditLog = [];
 
   let changed = false;
   const wantSeed = [
@@ -557,12 +633,22 @@ app.post('/api/auth/login', async (req, res) => {
   const acc = findAccount(db, username);
   if (!acc) return res.status(401).json({ error: 'Invalid credentials.' });
 
-  const ok = bcrypt.compareSync(password, acc.passwordHash || '');
-  if (!ok) return res.status(401).json({ error: 'Invalid credentials.' });
+  ensureAccountCollections(acc);
+  if (acc.lockUntil && Date.parse(String(acc.lockUntil)) > Date.now()) {
+    return res.status(423).json({ error: 'Account temporarily locked. Try again later.' });
+  }
 
+  const ok = bcrypt.compareSync(password, acc.passwordHash || '');
+  if (!ok) {
+    registerFailedLogin(acc);
+    saveDb();
+    addAudit(acc.username, 'login_failed', acc.lockUntil ? 'Account locked after repeated failures.' : 'Invalid password.');
+    return res.status(401).json({ error: acc.lockUntil ? 'Too many failed attempts. Account locked temporarily.' : 'Invalid credentials.' });
+  }
+
+  clearFailedLoginState(acc);
   acc.sessionId = makeSessionId();
   acc.lastLoginAt = nowISO();
-  ensureAccountCollections(acc);
   saveDb();
 
   forceLogoutUserSockets(acc.username);
@@ -574,8 +660,9 @@ app.post('/api/auth/login', async (req, res) => {
       sessionId: acc.sessionId,
     },
     JWT_SECRET,
-    { expiresIn: '30d' }
+    { expiresIn: SESSION_EXPIRES_IN }
   );
+  addAudit(acc.username, 'login_success', 'Session started.');
 
   return res.json({
     token,
@@ -598,6 +685,9 @@ app.post('/api/uploads/pdf', requireAuth, requireContentManager, (req, res) => {
 
     const fileInfo = buildPdfUploadResponse(req, req.file.filename);
     addLog(req.user.username, `Uploaded PDF: ${req.file.originalname || req.file.filename}`);
+    addAudit(req.user.username, 'pdf_upload', req.file.originalname || req.file.filename);
+    pushNotification('quiz', 'New notes available', `${req.user.username} uploaded ${req.file.originalname || req.file.filename}.`, { audience: 'all', createdBy: req.user.username });
+    saveDb();
     return res.json({ ok: true, file: fileInfo });
   });
 });
@@ -609,6 +699,8 @@ app.delete('/api/uploads/pdf', requireAuth, requireContentManager, (req, res) =>
   try {
     if (fs.existsSync(resolved.abs)) fs.unlinkSync(resolved.abs);
     addLog(req.user.username, `Deleted PDF: ${resolved.filename}`);
+    addAudit(req.user.username, 'pdf_delete', resolved.filename);
+    saveDb();
     return res.json({ ok: true });
   } catch (err) {
     return res.status(500).json({ error: String(err?.message || err) });
@@ -645,6 +737,8 @@ app.post('/api/library/restore/:id', requireAuth, requireAdmin, (req, res) => {
     db.libraryVersions = db.libraryVersions.slice(0, MAX_LIBRARY_VERSIONS);
 
     db.library = restored;
+    pushNotification('announcement', 'Library restored', `${req.user.username} restored a previous library version.`, { audience: 'all', createdBy: req.user.username });
+    addAudit(req.user.username, 'library_restore', id);
     saveDb();
 
     const ms = Date.parse(restored.updatedAt) || Date.now();
@@ -667,6 +761,11 @@ app.put('/api/library', requireAuth, requireContentManager, (req, res) => {
     db.libraryVersions = db.libraryVersions.slice(0, MAX_LIBRARY_VERSIONS);
 
     db.library = incoming;
+    const quizDelta = Number((incoming.quizSets || []).length) - Number((previous.quizSets || []).length);
+    const pdfDelta = Number((incoming.pdfs || []).length) - Number((previous.pdfs || []).length);
+    if (quizDelta > 0) pushNotification('quiz', 'New quiz uploaded', `${req.user.username} added ${quizDelta} new quiz set(s).`, { audience: 'all', createdBy: req.user.username });
+    if (pdfDelta > 0) pushNotification('notes', 'New notes available', `${req.user.username} added ${pdfDelta} new PDF note(s).`, { audience: 'all', createdBy: req.user.username });
+    addAudit(req.user.username, 'library_update', `${quizDelta > 0 ? quizDelta + ' quiz set(s), ' : ''}${pdfDelta > 0 ? pdfDelta + ' PDF(s)' : 'content updated'}`);
     saveDb();
 
     const ms = Date.parse(incoming.updatedAt) || Date.now();
@@ -690,7 +789,7 @@ app.post('/api/accounts', requireAuth, requireAdmin, (req, res) => {
   const role = ['admin', 'editor', 'user'].includes(rawRole) ? rawRole : 'user';
 
   if (!username || !password) return res.status(400).json({ error: 'username and password required.' });
-  if (password.length < 3) return res.status(400).json({ error: 'password too short.' });
+  if (!isStrongPassword(password)) return res.status(400).json({ error: `Password must be at least ${PASSWORD_MIN_LENGTH} characters and include letters and numbers.` });
   if (findAccount(db, username)) return res.status(409).json({ error: 'Account already exists.' });
 
   const acc = {
@@ -706,6 +805,8 @@ app.post('/api/accounts', requireAuth, requireAdmin, (req, res) => {
   saveDb();
 
   addLog(req.user.username, `Created account: ${username} (${role})`);
+  addAudit(req.user.username, 'account_create', `${username} (${role})`);
+  saveDb();
   return res.json({ ok: true, account: toSafeAccount(acc) });
 });
 
@@ -724,6 +825,9 @@ app.post('/api/scores', requireAuth, (req, res) => {
   const item = sanitizeScoreEntry(req.body || {});
   acc.scoreHistory.unshift(item);
   acc.scoreHistory = acc.scoreHistory.slice(0, MAX_SCORE_HISTORY);
+  if (Number(item.percent || 0) >= 100) pushNotification('score', 'Perfect score achieved', `You scored ${item.score}/${item.total} on ${item.setTitle}.`, { audience: 'user', username: acc.username, createdBy: 'system' });
+  else if (Number(item.percent || 0) >= 85) pushNotification('score', 'Score milestone reached', `You reached ${item.percent}% on ${item.setTitle}.`, { audience: 'user', username: acc.username, createdBy: 'system' });
+  addAudit(req.user.username, 'score_saved', `${item.setTitle} ${item.score}/${item.total}`);
   saveDb();
   addLog(req.user.username, `Saved score: ${item.setTitle} ${item.score}/${item.total}`);
   return res.json({ ok: true, item });
@@ -740,8 +844,40 @@ app.post('/api/progress', requireAuth, (req, res) => {
   if (!acc) return res.status(404).json({ error: 'Account not found.' });
   const event = sanitizeProgressEvent(req.body || {});
   const item = applyProgressEvent(acc, event);
+  addAudit(req.user.username, 'progress_saved', `${item.setTitle || 'Quiz'} • ${item.lastAction || event.action || 'event'}`);
   saveDb();
   return res.json({ ok: true, item });
+});
+
+
+app.get('/api/notifications', requireAuth, (req, res) => {
+  return res.json({ items: getNotificationsForUser(req.user) });
+});
+
+app.post('/api/announcements', requireAuth, requireAdmin, (req, res) => {
+  const title = String(req.body?.title || '').trim();
+  const body = String(req.body?.body || '').trim();
+  if (!title || !body) return res.status(400).json({ error: 'title and body required.' });
+  const item = pushNotification('announcement', title, body, { audience: 'all', createdBy: req.user.username });
+  addAudit(req.user.username, 'announcement_create', title);
+  saveDb();
+  return res.json({ ok: true, item });
+});
+
+app.get('/api/audit-log', requireAuth, requireAdmin, (_req, res) => {
+  return res.json({ items: (db.auditLog || []).slice(0, MAX_AUDIT_LOG) });
+});
+
+app.get('/api/user-backup', requireAuth, (req, res) => {
+  const acc = findAccount(db, req.user.username);
+  if (!acc) return res.status(404).json({ error: 'Account not found.' });
+  ensureAccountCollections(acc);
+  return res.json({
+    username: acc.username,
+    scoreHistory: acc.scoreHistory || [],
+    progress: getProgressList(acc),
+    notifications: getNotificationsForUser(req.user),
+  });
 });
 
 let forceLogoutUserSockets = () => {};
